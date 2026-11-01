@@ -1,4 +1,0 @@
-bleak>=0.22
-paho-mqtt>=2.0
-pandas>=2.0
-matplotlib>=3.8

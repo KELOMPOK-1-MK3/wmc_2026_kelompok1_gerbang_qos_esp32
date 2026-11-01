@@ -40,11 +40,11 @@
 
 // --- Kredensial --------------------------------------------------------------
 // Sandi WiFi jangan ditulis di berkas ini (repository publik). Isi
-// firmware/esp32-gateway/rahasia.h — berkas itu masuk .gitignore.
-// Tanpa rahasia.h, papan tetap menyala sebagai hotspot dan mencatat bingkai,
+// firmware/esp32-gateway/hotspot.h — berkas itu masuk .gitignore.
+// Tanpa hotspot.h, papan tetap menyala sebagai hotspot dan mencatat bingkai,
 // hanya saja jalur uplink tidak tersambung (rtt,-1).
-#if __has_include("rahasia.h")
-  #include "rahasia.h"
+#if __has_include("hotspot.h")
+  #include "hotspot.h"
 #endif
 
 #ifndef UPLINK_SSID
@@ -93,6 +93,32 @@ static void kirim(const char *fmt, ...) {
   Serial.println(buf);
 }
 
+// Antrean baris untuk dipakai dari CALLBACK SNIFFER.
+// Serial.println di dalam callback memblokir task driver Wi-Fi: satu baris
+// 160 byte pada 115200 baud ≈ 14 ms. Setiap paket DNS membuat driver
+// berhenti 14 ms, sehingga throughput anjlok (terukur ~7 KB/s, seharusnya
+// ~1 MB/s) dan probe RTT ikut gagal. Baris ditampung dulu di sini, lalu
+// dicetak oleh loop() yang bukan task driver.
+#define ANTREAN_BARIS 16
+#define ANTREAN_PANJANG 96
+static char antrean[ANTREAN_BARIS][ANTREAN_PANJANG];
+static volatile uint8_t antrean_kepala = 0, antrean_ekor = 0;
+
+static void antre(const char *teks) {
+  uint8_t next = (antrean_kepala + 1) % ANTREAN_BARIS;
+  if (next == antrean_ekor) return;            // penuh: buang, jangan blokir
+  strncpy(antrean[antrean_kepala], teks, ANTREAN_PANJANG - 1);
+  antrean[antrean_kepala][ANTREAN_PANJANG - 1] = 0;
+  antrean_kepala = next;
+}
+
+static void kuras_antrean(void) {
+  while (antrean_ekor != antrean_kepala) {
+    Serial.println(antrean[antrean_ekor]);
+    antrean_ekor = (antrean_ekor + 1) % ANTREAN_BARIS;
+  }
+}
+
 static void mac_teks(const uint8_t *m, char *out) {
   sprintf(out, "%02x:%02x:%02x:%02x:%02x:%02x", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
@@ -110,6 +136,33 @@ static Perangkat *cari_perangkat(const uint8_t *mac) {
     }
   }
   return nullptr;  // tabel penuh
+}
+
+// Alamat IP klien diambil dari sewa DHCP, BUKAN dari isi paket.
+// Pada AP ber-WPA2 isi paket terenkripsi sehingga IP sumber/tujuan tidak
+// terbaca; sewa DHCP tetap tersedia di sisi papan.
+static uint32_t ip_dari_dhcp(const uint8_t *mac) {
+  static esp_netif_t *netif_ap = nullptr;
+  if (netif_ap == nullptr) netif_ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (netif_ap == nullptr) return 0;
+
+  esp_netif_pair_mac_ip_t pasangan[8];
+  memset(pasangan, 0, sizeof(pasangan));
+  for (int i = 0; i < 8; i++) memcpy(pasangan[i].mac, mac, 6);
+
+  esp_err_t err = esp_netif_dhcps_get_clients_by_mac(netif_ap, 8, pasangan);
+  if (err != ESP_OK) return 0;
+  for (int i = 0; i < 8; i++) {
+    if (memcmp(pasangan[i].mac, mac, 6) == 0) {
+      // esp_ip4_addr_t.addr disimpan urutan jaringan (big-endian). Dibaca
+      // sebagai uint32_t di ESP32 (little-endian) hasilnya terbalik, jadi
+      // oktet diambil satu per satu agar tidak bergantung endianness.
+      const uint8_t *b = (const uint8_t *)&pasangan[i].ip.addr;
+      return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+             ((uint32_t)b[2] << 8) | (uint32_t)b[3];
+    }
+  }
+  return 0;
 }
 
 static bool dari_papan(const uint8_t *mac) { return memcmp(mac, mac_ap, 6) == 0; }
@@ -142,33 +195,27 @@ static void catat_dns(const uint8_t *dns, int len, uint32_t ip_klien, const uint
 
   char teks_mac[18];
   mac_teks(mac_klien, teks_mac);
-  kirim("dns,%s,%u.%u.%u.%u,%s", teks_mac, (ip_klien >> 24) & 0xFF, (ip_klien >> 16) & 0xFF,
-        (ip_klien >> 8) & 0xFF, ip_klien & 0xFF, nama);
+  // Dipanggil dari callback sniffer, jadi masuk antrean (lihat antre()).
+  char baris[ANTREAN_PANJANG];
+  snprintf(baris, sizeof(baris), "dns,%s,%u.%u.%u.%u,%s", teks_mac,
+           (ip_klien >> 24) & 0xFF, (ip_klien >> 16) & 0xFF,
+           (ip_klien >> 8) & 0xFF, ip_klien & 0xFF, nama);
+  antre(baris);
 }
 
 // --------------------------------------------------- hitung bingkai 802.11 --
 
 static void hitung_bingkai(const uint8_t *f, int len, bool retry) {
-  if (len < 24 + 8 + 20) return;
+  if (len < 24) return;
   if ((f[0] & 0x0C) != 0x08) return;          // hanya bingkai data
 
   bool qos = (f[0] & 0x80) != 0;               // QoS data: header lebih panjang
   int hdr = qos ? 26 : 24;
-  if (len < hdr + 8 + 20) return;
+  if (len < hdr) return;
 
-  const uint8_t *llc = f + hdr;
-  if (!(llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03)) return;
-  if (!(llc[6] == 0x08 && llc[7] == 0x00)) return;   // IPv4 saja
-
-  const uint8_t *ip = llc + 8;
-  int ip_len = len - hdr - 8;
-  if ((ip[0] >> 4) != 4) return;
-  int hdr_ip = (ip[0] & 0x0F) * 4;
-  if (hdr_ip < 20 || ip_len < hdr_ip) return;
-
-  uint32_t sumber = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) | ((uint32_t)ip[14] << 8) | ip[15];
-  uint32_t tujuan = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) | ((uint32_t)ip[18] << 8) | ip[19];
-
+  // Alamat MAC ada di HEADER 802.11 dan selalu dikirim tanpa enkripsi,
+  // meskipun payload-nya dienkripsi WPA2. Jadi arah dan pemilik bingkai
+  // bisa ditentukan tanpa mendekripsi apa pun.
   const uint8_t *addr1 = f + 4;   // penerima di radio
   const uint8_t *addr2 = f + 10;  // pengirim di radio
 
@@ -184,8 +231,11 @@ static void hitung_bingkai(const uint8_t *f, int len, bool retry) {
   }
   if (!p) return;
 
+  // Hitung byte SEBELUM mencoba membaca isi paket. Dulu pemeriksaan LLC/IP
+  // dilakukan lebih awal, sehingga pada AP ber-WPA2 semua bingkai ditolak
+  // (payload terenkripsi, tidak pernah 0xAA 0xAA 0x03) dan seluruh angka
+  // perangkat selalu nol tanpa pesan galat apa pun.
   portENTER_CRITICAL_ISR(&kunci);
-  p->ip = naik ? sumber : tujuan;
   p->terakhir_lihat = millis();
   if (naik) {
     p->byte_naik += len;
@@ -196,15 +246,35 @@ static void hitung_bingkai(const uint8_t *f, int len, bool retry) {
   }
   if (retry) p->bingkai_retry++;
 
-  // Pertanyaan DNS dari perangkat: protokol UDP, port tujuan 53.
-  if (naik && ip[9] == 17) {
-    int off = hdr_ip;
-    if (ip_len >= off + 8) {
-      const uint8_t *udp = ip + off;
-      uint16_t port_tujuan = (udp[2] << 8) | udp[3];
-      int panjang_udp = (udp[4] << 8) | udp[5];
-      if (port_tujuan == 53 && panjang_udp > 12 && ip_len >= off + 8 + 12) {
-        catat_dns(udp + 8, min((int)panjang_udp, ip_len - off - 8), sumber, p->mac);
+  // Isi paket hanya bisa dibaca bila jaringannya TERBUKA (tanpa sandi).
+  // Pada WPA2 bagian ini dilewati: IP dan nama domain tidak tersedia,
+  // tetapi byte dan jumlah bingkai per perangkat tetap terhitung.
+  const uint8_t *llc = f + hdr;
+  int ip_len = len - hdr;
+  bool terbaca = (ip_len >= 8 + 20)
+                 && llc[0] == 0xAA && llc[1] == 0xAA && llc[2] == 0x03
+                 && llc[6] == 0x08 && llc[7] == 0x00;   // IPv4 saja
+  if (terbaca) {
+    const uint8_t *ip = llc + 8;
+    ip_len -= 8;
+    if ((ip[0] >> 4) == 4) {
+      int hdr_ip = (ip[0] & 0x0F) * 4;
+      if (hdr_ip >= 20 && ip_len >= hdr_ip) {
+        uint32_t sumber = ((uint32_t)ip[12] << 24) | ((uint32_t)ip[13] << 16) |
+                          ((uint32_t)ip[14] << 8) | ip[15];
+        uint32_t tujuan = ((uint32_t)ip[16] << 24) | ((uint32_t)ip[17] << 16) |
+                          ((uint32_t)ip[18] << 8) | ip[19];
+        p->ip = naik ? sumber : tujuan;
+
+        // Pertanyaan DNS dari perangkat: protokol UDP, port tujuan 53.
+        if (naik && ip[9] == 17 && ip_len >= hdr_ip + 8) {
+          const uint8_t *udp = ip + hdr_ip;
+          uint16_t port_tujuan = (udp[2] << 8) | udp[3];
+          int panjang_udp = (udp[4] << 8) | udp[5];
+          if (port_tujuan == 53 && panjang_udp > 12 && ip_len >= hdr_ip + 8 + 12) {
+            catat_dns(udp + 8, min((int)panjang_udp, ip_len - hdr_ip - 8), sumber, p->mac);
+          }
+        }
       }
     }
   }
@@ -258,6 +328,18 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS, 6, 0, BATAS_KLIEN);
   WiFi.AP.enableNAPT(true);
+
+  // Urutan WAJIB: softAP() dulu, baru softAPConfig(). Kalau dibalik,
+  // softAP() menimpa konfigurasi netif dan parameter dns hilang — DHCP
+  // kembali membagikan 192.168.4.1 (papan itu sendiri) sebagai DNS,
+  // padahal papan tidak menjalankan server DNS. Akibatnya HP gagal
+  // resolusi nama, menandai WiFi "tanpa internet", lalu memutus sendiri.
+  // Parameter ke-5 adalah DNS yang dikirim ke klien lewat DHCP option 6.
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1),   // IP papan di jaringan AP
+                    IPAddress(192, 168, 4, 1),   // gateway
+                    IPAddress(255, 255, 255, 0), // subnet
+                    IPAddress(192, 168, 4, 2),   // awal sewa DHCP
+                    IPAddress(1, 1, 1, 1));      // DNS untuk klien
   // Ambil 6 byte BINER alamat MAC AP. WiFi.softAPmacAddress() tanpa argumen
   // mengembalikan String "84:1F:E8:27:C6:18", jadi .c_str() + memcpy 6 akan
   // mengambil karakter ASCII '8','4',':','1','F',':' — bukan alamat MAC.
@@ -274,6 +356,15 @@ void setup() {
                   WiFi.localIP().toString().c_str(), WiFi.channel());
   } else {
     Serial.println("# uplink gagal; perangkat uji belum punya internet");
+  }
+  // AP dan STA berbagi satu radio, jadi kanal AP dipaksa ikut kanal uplink.
+  // Bila uplink di kanal 12-13, banyak HP menolak/tidak stabil — dicatat
+  // supaya penyebabnya langsung terlihat saat uji.
+  {
+    int kanal_ap = WiFi.channel();
+    Serial.printf("# AP %s, ip %s, kanal %d%s\n", AP_SSID,
+                  WiFi.softAPIP().toString().c_str(), kanal_ap,
+                  (kanal_ap >= 12) ? " (KANAL 12-13: banyak HP menolak!)" : "");
   }
 
   // Dengarkan bingkai data di kanal sendiri untuk menghitung pemakaian.
@@ -293,6 +384,10 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
   }
 
+  // Cetak baris DNS yang ditampung callback sniffer. loop() bukan task
+  // driver Wi-Fi, jadi menulis Serial di sini tidak menghentikan jaringan.
+  kuras_antrean();
+
   if (millis() - terakhir_lapor >= INTERVAL_LAPOR) {
     terakhir_lapor = millis();
 
@@ -303,7 +398,9 @@ void loop() {
         char teks[18];
         mac_teks(daftar.sta[i].mac, teks);
         Perangkat *p = cari_perangkat(daftar.sta[i].mac);
-        uint32_t ip = p ? p->ip : 0;
+        // IP dari sewa DHCP; isi paket tidak terbaca pada AP ber-WPA2.
+        uint32_t ip = p ? (p->ip ? p->ip : ip_dari_dhcp(daftar.sta[i].mac)) : 0;
+        if (p && ip && !p->ip) p->ip = ip;
         kirim("st,%s,%u.%u.%u.%u,%d", teks, (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF,
               ip & 0xFF, daftar.sta[i].rssi);
       }

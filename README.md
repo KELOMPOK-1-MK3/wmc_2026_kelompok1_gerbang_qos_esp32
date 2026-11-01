@@ -111,7 +111,6 @@ wmc_2026_kelompok1_monitoring_kesehatan_nirkabel/
 ├── src/
 │   ├── penerima/        # pembaca USB serial, hitung QoS, simpan SQLite, sajikan dashboard
 │   └── dashboard/       # tampilan tema terang (HTML + JS tanpa pustaka)
-├── arsip/               # kode topik lama (node sensor kesehatan) — disimpan, tidak dipakai
 └── data/                # hasil pengukuran
 ```
 
@@ -177,6 +176,6 @@ Yang **belum** (jangan diklaim selesai):
 
 Topik awal mata kuliah ini adalah *wearable health monitor* dua node (MAX30102 +
 MLX90614). Topik itu tidak dilanjutkan karena kedua sensor tidak tersedia, lalu
-diganti menjadi pemantauan QoS banyak perangkat dengan ESP32 sebagai gerbang. Kode,
-dokumen, dan diagram topik lama dipindahkan ke `arsip/` — tidak dihapus, agar jejak
-kerja sebelumnya tetap terlihat.
+diganti menjadi pemantauan QoS banyak perangkat dengan ESP32 sebagai gerbang. Kode
+dan diagram topik lama sudah dihapus dari repository agar tidak membingungkan; jejaknya
+masih dapat dilihat di riwayat git (`git log --diff-filter=D --name-only`).
