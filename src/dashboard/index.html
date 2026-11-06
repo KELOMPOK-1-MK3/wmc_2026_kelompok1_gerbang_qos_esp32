@@ -1095,8 +1095,103 @@
   });
 
   pasangSkema();
+
+  // ---------------------------------------------------------------- DEMO STANDALONE --
+  // Bila fetch /api/state gagal (tidak ada server Python), aktifkan simulator built-in.
+  // Data tiruan dihasilkan di sini, tidak perlu koneksi jaringan sama sekali.
+  const _sim = (() => {
+    const PERANGKAT = [
+      { mac: '3c:5a:b4:11:22:33', ip: '192.168.4.2', rssi: -48, dns: ['tiktokcdn.com','i.instagram.com'] },
+      { mac: '8c:aa:b5:44:55:66', ip: '192.168.4.3', rssi: -62, dns: ['googlevideo.com','youtube.com'] },
+      { mac: 'e4:5f:01:77:88:99', ip: '192.168.4.4', rssi: -71, dns: ['wa.me','cdn.whatsapp.net'] },
+      { mac: 'a0:b7:65:aa:bb:cc', ip: '192.168.4.5', rssi: -78, dns: ['spotify.com','detik.com'] },
+    ];
+    const kum = PERANGKAT.map(() => ({ naik: 0, turun: 0, bn: 0, bt: 0, bu: 0 }));
+    const histori = [];
+    let detik = 0;
+    let aktif = 1;
+    let gagalRtt = 0;
+    const mulai = new Date().toISOString();
+
+    function langkah() {
+      detik++;
+      if (detik % 20 === 0) aktif = Math.min(aktif + 1, 4);
+
+      const rttMs = Math.max(10, Math.round(28 + aktif * 14 + (Math.random() - 0.5) * 12));
+      const perangkat = [];
+
+      for (let i = 0; i < aktif; i++) {
+        const p = PERANGKAT[i];
+        const k = kum[i];
+        const beban = i === 0 ? 0.8 + Math.random() * 0.2 : 0.2 + Math.random() * 0.6;
+        const dTurun = Math.round(Math.max(0, (180000 + (Math.random() - 0.5) * 60000) * beban));
+        const dNaik  = Math.round(Math.max(0, (28000  + (Math.random() - 0.5) * 10000) * beban));
+        const dBt    = Math.round(Math.max(0, (155 + (Math.random() - 0.5) * 30) * beban));
+        const dBn    = Math.round(Math.max(0, (110 + (Math.random() - 0.5) * 20) * beban));
+        const dBu    = Math.round(Math.max(0, Math.abs((Math.random() - 0.3) * 4) * (1 + aktif / 3)));
+        k.turun += dTurun; k.naik += dNaik;
+        k.bt += dBt; k.bn += dBn; k.bu += dBu;
+        const totalB = dBn + dBt;
+        perangkat.push({
+          mac: p.mac, ip: p.ip, rssi: p.rssi,
+          naik_kbps:  Math.round(dNaik  * 8 / 1000 / 1),
+          turun_kbps: Math.round(dTurun * 8 / 1000 / 1),
+          bingkai: totalB,
+          ulang: dBu,
+          ulang_persen: totalB ? parseFloat((100 * dBu / totalB).toFixed(1)) : 0,
+          dns: p.dns,
+        });
+      }
+      perangkat.sort((a, b) => (b.turun_kbps + b.naik_kbps) - (a.turun_kbps + a.naik_kbps));
+
+      const totalNaik  = perangkat.reduce((s, p) => s + p.naik_kbps,  0);
+      const totalTurun = perangkat.reduce((s, p) => s + p.turun_kbps, 0);
+      histori.push({ t: detik, naik: Math.round(totalNaik / 100) / 10, turun: Math.round(totalTurun / 100) / 10, rtt: rttMs });
+      if (histori.length > 180) histori.shift();
+
+      return {
+        mode: 'sim',
+        detik,
+        klien: aktif,
+        rssi_uplink: -52,
+        rtt: {
+          sekarang: rttMs,
+          rata2: parseFloat((histori.reduce((s, h) => s + (h.rtt || 0), 0) / histori.length).toFixed(1)),
+          min: Math.min(...histori.map(h => h.rtt || 999)),
+          maks: Math.max(...histori.map(h => h.rtt || 0)),
+          gagal: gagalRtt,
+        },
+        perangkat,
+        histori: [...histori],
+        sesi: 1,
+        mulai,
+      };
+    }
+
+    return { langkah };
+  })();
+
+  let _modeDemo = false;
+
+  async function _putarAsli() {
+    if (jeda) return;
+    try {
+      const jawab = await fetch('/api/state', { cache: 'no-store' });
+      if (!jawab.ok) throw new Error('kode ' + jawab.status);
+      _modeDemo = false;
+      render(await jawab.json(), Date.now());
+    } catch (e) {
+      // Tidak ada server → pakai simulator built-in
+      _modeDemo = true;
+      render(_sim.langkah(), Date.now());
+    }
+  }
+
+  // Ganti fungsi putar asli dengan versi yang fallback ke demo
+  // (redefinisi di scope IIFE ini tidak memengaruhi yang luar,
+  //  jadi kita patch interval secara langsung)
   putar();
-  setInterval(putar, 1000);
+  setInterval(_putarAsli, 1000);
 
   const kurangiGerak = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   setInterval(() => gambarAnimasi(performance.now()), kurangiGerak ? 500 : 60);

@@ -36,14 +36,3 @@ firmware/*/build/
 # Kredensial lokal per Laptop
 rahasia*.h
 firmware/*/hotspot.h
-
-# File debug dan log sementara
-src/penerima/debug_*.py
-src/penerima/debug_*.log
-src/penerima/jalankan_sim_windows.py
-
-# Screenshot sementara di docs/diagrams
-docs/diagrams/Screenshot*.png
-
-# Database simulasi live
-data/sim_live.db
